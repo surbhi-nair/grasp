@@ -15,6 +15,7 @@ from grasp.tasks.shapes_setup import ShapesSetupTask
 from grasp.tasks.sparql_qa import SparqlQaTask
 from grasp.tasks.sparql_to_question import SparqlToQuestionTask
 from grasp.tasks.wikidata_query_logs import WdqlTask
+from grasp.tasks.construct_gen import ConstructGenTask
 
 
 # official tasks supported by GRASP, excluding exploration
@@ -40,6 +41,7 @@ _REGISTRY: dict[str, type[GraspTask]] = {
         QuestionGenerationTask,
         AutoSetupTask,
         ShapesSetupTask,
+        ConstructGenTask
     ]
 }
 

@@ -633,6 +633,24 @@ def parse_args() -> argparse.Namespace:
         help="Notes passed to the setup agent (single-phase runs only: info, entities, properties, literals, shapes)",
     )
 
+    # generate CONSTRUCT query for generic RDF
+    construct_parser = subparsers.add_parser(
+        "construct",
+        help="Generate a SPARQL CONSTRUCT query to semantify a generic RDF knowledge graph",
+    )
+    construct_parser.add_argument(
+        "knowledge_graph",
+        type=str,
+        help="Knowledge graph to generate the CONSTRUCT query for",
+    )
+    add_config_arg(construct_parser)
+    construct_parser.add_argument(
+        "output_dir",
+        type=str,
+        help="Directory to write the .nt file, CONSTRUCT query, and trace to",
+    )
+    add_overwrite_arg(construct_parser)
+
     # visualize trace from GRASP output
     show_parser = subparsers.add_parser(
         "show",
@@ -1187,6 +1205,85 @@ def shapes_build_grasp(args: argparse.Namespace) -> None:
         total_classes=total_classes,
     )
 
+def construct_grasp(args: argparse.Namespace) -> None:
+    logger = get_logger("GRASP CONSTRUCT", args.log_level)
+    config = GraspConfig(**load_config(args.config))
+
+    managers, _ = setup(config)
+    if not managers:
+        logger.error("No KG managers available")
+        return
+
+    manager, _ = find_manager(managers, args.knowledge_graph)
+    notes, kg_notes = load_notes(config)
+
+    output_dir = args.output_dir
+    if os.path.exists(output_dir) and not args.overwrite:
+        logger.error(
+            f"Output directory {output_dir} already exists. "
+            "Use --overwrite to overwrite."
+        )
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    result = consume_generator(
+        generate(
+            "construct-gen",
+            None,
+            config,
+            managers,
+            kg_notes=kg_notes,
+            notes=notes,
+            logger=logger,
+            yield_output=True,
+        )
+    )
+
+    # always save the trace
+    dump_json(result, os.path.join(output_dir, "trace.json"))
+    logger.info(f"Trace written to {output_dir}/trace.json")
+
+    task_output = result.get("output")
+    if not task_output:
+        logger.error("No output produced by the task")
+        return
+
+    sparql = task_output.get("sparql")
+    kg = task_output.get("kg")
+
+    if not sparql:
+        logger.error("Task completed but no CONSTRUCT query was returned")
+        return
+
+    # save the construct query
+    dump_text(sparql, os.path.join(output_dir, "construct.sparql"))
+    logger.info(f"CONSTRUCT query written to {output_dir}/construct.sparql")
+
+    # execute the full query and save the .nt
+    logger.info("Executing full CONSTRUCT query...")
+    manager_for_kg, _ = find_manager(managers, kg)
+    req_params = {**manager_for_kg.params, "query": sparql}
+    req_headers = {**manager_for_kg.headers, "Accept": "text/plain"}
+
+    import requests as req
+    response = req.get(
+        manager_for_kg.endpoint,
+        params=req_params,
+        headers=req_headers,
+        timeout=300.0,
+    )
+
+    if response.status_code != 200:
+        logger.error(f"CONSTRUCT query failed: HTTP {response.status_code}\n{response.text[:500]}")
+        return
+
+    nt_content = response.text
+    nt_path = os.path.join(output_dir, "semantic.nt")
+    dump_text(nt_content, nt_path)
+
+    triple_count = sum(1 for l in nt_content.splitlines() if l.strip())
+    logger.info(f"Written {triple_count} triples to {nt_path}")
 
 def main():
     args = parse_args()
@@ -1251,6 +1348,9 @@ def main():
             args.log_level,
             args.description,
         )
+
+    elif args.command == "construct":
+        construct_grasp(args)
 
 
 if __name__ == "__main__":
