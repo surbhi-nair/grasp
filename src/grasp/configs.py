@@ -44,11 +44,12 @@ class ModelConfig(BaseModel):
     seed: int | None = None
 
     # model parameters
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     model_provider: Literal[
         "openai/completions",
         "openai/responses",
-    ] = "openai/completions"
+        "anthropic",
+    ] = "openai/responses"
     model_endpoint: str | None = None
     model_api_key: str | None = Field(default=None, exclude=True)
     model_timeout: float = 120.0
