@@ -17,8 +17,15 @@
 
   // Read route parameters from the query string (set by nginx redirects).
   // e.g. ?share=abc123, ?kgs=wikidata+gptkb, ?task=sparql-qa
+  //
+  // The shorthand path form takes a single '+'-separated segment that may mix
+  // KG names and one task id in any order, e.g. /wikidata+freebase+sparql-qa
+  // or /entity-linking+wikidata or just /cea. A token that is both a task id
+  // and the name of an available KG is resolved as a KG once the KG list is
+  // known (see resolvePathTaskAmbiguity).
   function readQueryParams() {
-    if (typeof window === 'undefined') return { loadId: null, kgs: [], task: null };
+    if (typeof window === 'undefined')
+      return { loadId: null, kgs: [], task: null, ambiguousTask: null };
     const params = new URLSearchParams(window.location.search);
     // Check query param first (?share=abc123), then path (/share/abc123).
     const shareMatch = window.location.pathname.match(/\/share\/([^/]+)\/?$/);
@@ -29,17 +36,31 @@
     let kgs = rawKgs
       ? rawKgs.split(',').map(s => decodeURIComponent(s.trim())).filter(Boolean)
       : [];
+    let pathTask = null;
     if (kgs.length === 0 && document.querySelector('meta[name="grasp-kg-path"]')) {
       const lastSegment = window.location.pathname.replace(/\/+$/, '').split('/').pop();
       if (lastSegment) {
-        kgs = lastSegment.split('+').map(s => decodeURIComponent(s.trim())).filter(Boolean);
+        const tokens = lastSegment
+          .split('+')
+          .map(s => decodeURIComponent(s.trim()))
+          .filter(Boolean);
+        // The first token naming a task selects the task; the rest are KGs.
+        const taskIndex = tokens.findIndex(isValidTaskId);
+        if (taskIndex >= 0) {
+          pathTask = tokens[taskIndex];
+          tokens.splice(taskIndex, 1);
+        }
+        kgs = tokens;
       }
     }
     const taskParam = params.get('task')?.trim() || null;
+    // An explicit ?task= wins over a path token and is never ambiguous.
+    const task = isValidTaskId(taskParam) ? taskParam : pathTask;
     return {
       loadId: shareId,
       kgs,
-      task: isValidTaskId(taskParam) ? taskParam : null
+      task,
+      ambiguousTask: task === pathTask ? pathTask : null
     };
   }
 
@@ -60,6 +81,10 @@ const SESSION_STORAGE_KEYS = {
   lastOutput: STORAGE_KEYS.lastOutput,
   lastInput: STORAGE_KEYS.lastInput
 };
+
+// Read before anything persists over it, so an ambiguous path token that turns
+// out to be a KG can fall back to the task the user last used.
+const storedTaskAtStartup = readStoredTask();
 
 function getSessionStorage() {
   if (typeof window === 'undefined') return null;
@@ -93,7 +118,14 @@ let running = false;
   let lastInputRecord = null;
   let urlSelectedKgs = initialKgSeed.length ? [...initialKgSeed] : null;
   let urlSelectedTask = initialTaskSeed;
+  // Path token read as a task id that could also be a KG name; resolved once
+  // the available KGs are known.
+  let ambiguousPathTask = queryParams.ambiguousTask;
   let pendingUrlReset = false;
+  let pendingTaskSwitch = null;
+
+  $: pendingTaskSwitchName =
+    TASKS.find((t) => t.id === pendingTaskSwitch)?.name ?? pendingTaskSwitch;
 
   $: hasHistory = histories.length > 0;
   $: knowledgeGraphList = Array.from(knowledgeGraphs.entries()).map(
@@ -109,6 +141,8 @@ let running = false;
     connectionStatus === 'error' ||
     connectionStatus === 'disconnected';
   $: ceaInitialPayload = task === 'cea' ? getLastCeaInput() : null;
+  $: elInitialPayload = task === 'entity-linking' ? getLastElInput() : null;
+  const PAYLOAD_INPUT_TASKS = new Set(['cea', 'entity-linking']);
   onMount(async () => {
     await initialize();
     await measureComposerOnce();
@@ -184,7 +218,7 @@ let running = false;
           parsedInput &&
           typeof parsedInput === 'object' &&
           typeof parsedInput.task === 'string';
-        if (isValidRecord && parsedInput.task === 'cea') {
+        if (isValidRecord && PAYLOAD_INPUT_TASKS.has(parsedInput.task)) {
           lastInputRecord = parsedInput;
         } else {
           sessionStore.removeItem(SESSION_STORAGE_KEYS.lastInput);
@@ -193,8 +227,35 @@ let running = false;
     } catch (error) {
       console.warn('Failed to restore persisted data', error);
     } finally {
-      applyUrlStateOverrides();
+      // URL selections are applied later, in loadKnowledgeGraphs, where the
+      // available KG names are known (see resolvePathTaskAmbiguity).
       persistCurrentSelections();
+    }
+  }
+
+  // A path token like /cea is read as a task id, but a KG of that name must win
+  // so the shorthand never silently swallows a KG. Called with the KG list.
+  function resolvePathTaskAmbiguity(available) {
+    if (!ambiguousPathTask) return;
+    const token = ambiguousPathTask;
+    ambiguousPathTask = null;
+    if (!available.includes(token)) return;
+    urlSelectedTask = null;
+    urlSelectedKgs = sanitizeInitialKgs([...(urlSelectedKgs ?? []), token]);
+    // restorePersistence skipped the stored task because the URL looked like it
+    // provided one; restore it now that we know it did not.
+    task = storedTaskAtStartup || TASKS[0].id;
+    persistTask(task);
+  }
+
+  function readStoredTask() {
+    if (typeof window === 'undefined') return null;
+    try {
+      const storedTask = window.localStorage.getItem(STORAGE_KEYS.task);
+      return isValidTaskId(storedTask) ? storedTask : null;
+    } catch (error) {
+      console.warn('Failed to read persisted task', error);
+      return null;
     }
   }
 
@@ -274,6 +335,20 @@ let running = false;
     return null;
   }
 
+  function getLastElInput() {
+    if (!lastInputRecord || lastInputRecord.task !== 'entity-linking') {
+      return null;
+    }
+    if (
+      lastInputRecord.value &&
+      typeof lastInputRecord.value === 'object' &&
+      typeof lastInputRecord.value.data === 'string'
+    ) {
+      return cloneLastInputValue(lastInputRecord.value) ?? lastInputRecord.value;
+    }
+    return null;
+  }
+
   async function loadServerConfig() {
     try {
       const response = await fetch(configEndpoint());
@@ -296,6 +371,9 @@ let running = false;
         throw new Error('No knowledge graphs available.');
       }
 
+      resolvePathTaskAmbiguity(available);
+      applyUrlStateOverrides();
+
       const next = new Map();
       for (const kg of available) {
         const selected = persistedSelectedKgs.includes(kg);
@@ -317,6 +395,10 @@ let running = false;
       knowledgeGraphs = next;
       persistSelectedKgs(selectedList);
     } catch (error) {
+      // Still honour the URL selections when the KG list is unavailable; an
+      // ambiguous path token then stays a task, as there is no KG to prefer.
+      resolvePathTaskAmbiguity([]);
+      applyUrlStateOverrides();
       throw decorateError(error, 'Failed to load knowledge graphs.');
     }
   }
@@ -424,6 +506,21 @@ let running = false;
           enrichedPayload = { ...payload, ceaInputTable: ceaInput };
         }
       }
+      if (payload.type === 'output' && payload.task === 'entity-linking') {
+        const elInput = getLastElInput();
+        if (elInput) {
+          enrichedPayload = { ...enrichedPayload, elInput };
+        }
+      }
+      // the raw input message for entity linking contains the full prompt
+      // scaffolding; attach the submitted payload so it can be rendered
+      // as the plain text with the annotation window highlighted
+      if (payload.type === 'input' && task === 'entity-linking') {
+        const elInput = getLastElInput();
+        if (elInput) {
+          enrichedPayload = { ...enrichedPayload, elInput };
+        }
+      }
       if (payload.type === 'output') {
         enrichedPayload =
           enrichedPayload === payload
@@ -503,6 +600,10 @@ let running = false;
       const detail = event.detail;
       if (!detail || detail.kind !== 'cea' || !detail.payload) return;
       payloadInput = detail.payload;
+    } else if (task === 'entity-linking') {
+      const detail = event.detail;
+      if (!detail || detail.kind !== 'entity-linking' || !detail.payload) return;
+      payloadInput = detail.payload;
     } else {
       const question = typeof event.detail === 'string' ? event.detail : '';
       const trimmedQuestion = question.trim();
@@ -559,8 +660,42 @@ let running = false;
   function handleTaskChange(event) {
     const nextTask = event.detail;
     if (!nextTask || task === nextTask) return;
+    // switching tasks mid-conversation would send the follow-up with the
+    // previous task's context (past messages and system prompt), so ask
+    // for confirmation and clear the conversation first
+    if (hasHistory || past) {
+      pendingTaskSwitch = nextTask;
+      return;
+    }
+    applyTaskChange(nextTask);
+  }
+
+  function applyTaskChange(nextTask) {
     task = nextTask;
     persistTask(task);
+  }
+
+  function confirmTaskSwitch() {
+    const nextTask = pendingTaskSwitch;
+    pendingTaskSwitch = null;
+    if (!nextTask) return;
+    composerValue = '';
+    updateStatusMessage('');
+    clearHistory('full');
+    replaceUrlWithRoot();
+    applyTaskChange(nextTask);
+  }
+
+  function cancelTaskSwitch() {
+    pendingTaskSwitch = null;
+  }
+
+  function handleTaskSwitchKeydown(event) {
+    if (pendingTaskSwitch === null) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelTaskSwitch();
+    }
   }
 
   function handleKnowledgeGraphChange(event) {
@@ -629,7 +764,7 @@ let running = false;
   function persistLastInput(record) {
     const sessionStore = getSessionStorage();
     if (!sessionStore) return;
-    if (!record || record.task !== 'cea') {
+    if (!record || !PAYLOAD_INPUT_TASKS.has(record.task)) {
       sessionStore.removeItem(SESSION_STORAGE_KEYS.lastInput);
       return;
     }
@@ -722,8 +857,8 @@ let running = false;
       : [];
     const shareInput =
       lastInputRecord &&
-      lastInputRecord.task === 'cea' &&
-      task === 'cea'
+      PAYLOAD_INPUT_TASKS.has(lastInputRecord.task) &&
+      lastInputRecord.task === task
         ? cloneLastInputValue(lastInputRecord.value)
         : null;
     return {
@@ -846,10 +981,10 @@ let running = false;
       if (sharedLastInput !== undefined) {
         const targetTask =
           typeof payload.task === 'string' ? payload.task : task;
-        if (sharedLastInput == null || targetTask !== 'cea') {
+        if (sharedLastInput == null || !PAYLOAD_INPUT_TASKS.has(targetTask)) {
           sessionStore?.removeItem(SESSION_STORAGE_KEYS.lastInput);
           lastInputRecord = null;
-        } else if (targetTask === 'cea') {
+        } else {
           const record = {
             task: targetTask,
             value: sharedLastInput
@@ -960,6 +1095,8 @@ let running = false;
 
 </script>
 
+<svelte:window on:keydown={handleTaskSwitchKeydown} />
+
 <section class="app-shell">
   <AppFooter />
 
@@ -997,12 +1134,55 @@ let running = false;
           on:taskchange={handleTaskChange}
           on:kgchange={handleKnowledgeGraphChange}
           initialCeaPayload={ceaInitialPayload}
+          initialElPayload={elInitialPayload}
           {sttEnabled}
         />
       </div>
     </main>
   </div>
 </section>
+
+{#if pendingTaskSwitch !== null}
+  <div
+    class="task-switch-backdrop"
+    role="presentation"
+    on:pointerdown={cancelTaskSwitch}
+  >
+    <div
+      class="task-switch-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="task-switch-title"
+      aria-describedby="task-switch-description"
+      on:pointerdown|stopPropagation
+      tabindex="-1"
+    >
+      <h2 class="task-switch-modal__title" id="task-switch-title">
+        Switch to {pendingTaskSwitchName}?
+      </h2>
+      <p class="task-switch-modal__description" id="task-switch-description">
+        Switching the task clears the current conversation and its context.
+        Follow-up inputs will start from scratch.
+      </p>
+      <div class="task-switch-modal__actions">
+        <button
+          type="button"
+          class="task-switch-modal__button task-switch-modal__button--secondary"
+          on:click={cancelTaskSwitch}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="task-switch-modal__button task-switch-modal__button--primary"
+          on:click={confirmTaskSwitch}
+        >
+          Switch and clear
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .app-shell {
@@ -1050,6 +1230,75 @@ let running = false;
 
   .composer-wrapper {
     width: 100%;
+  }
+
+  .task-switch-backdrop {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--spacing-lg);
+    background: rgba(5, 17, 51, 0.45);
+    z-index: 1000;
+  }
+
+  .task-switch-modal {
+    background: #fff;
+    border-radius: var(--radius-md);
+    box-shadow: 0 20px 40px rgba(5, 17, 51, 0.2);
+    max-width: 26rem;
+    width: 100%;
+    outline: none;
+    display: grid;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-xl);
+  }
+
+  .task-switch-modal__title {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--color-uni-blue);
+  }
+
+  .task-switch-modal__description {
+    margin: 0;
+    font-size: 0.9rem;
+    color: var(--text-subtle);
+  }
+
+  .task-switch-modal__actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--spacing-xs);
+    margin-top: var(--spacing-xs);
+  }
+
+  .task-switch-modal__button {
+    padding: 0.45rem 1rem;
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    font: inherit;
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+  }
+
+  .task-switch-modal__button--secondary {
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    background: #fff;
+    color: var(--text-primary);
+  }
+
+  .task-switch-modal__button--primary {
+    border: none;
+    background: var(--color-uni-blue);
+    color: #fff;
+  }
+
+  .task-switch-modal__button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 16px rgba(52, 74, 154, 0.15);
   }
 
   .composer-wrapper--sticky {

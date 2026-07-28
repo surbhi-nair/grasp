@@ -53,17 +53,26 @@ export const TASKS = Object.freeze([
       'Answer questions by retrieving relevant information from knowledge graphs.'
   },
   {
+    id: 'sparql-to-question',
+    name: 'SPARQL to Question',
+    tooltip: 'Convert a SPARQL query into a natural language question.'
+  },
+  {
+    id: 'entity-linking',
+    name: 'Entity Linking',
+    tooltip:
+      'Annotate entity mentions in a text with corresponding knowledge graph entities.'
+  },
+  {
     id: 'cea',
     name: 'Cell Entity Annotation',
     tooltip:
       'Upload a CSV table to annotate each cell with corresponding knowledge graph entities.'
-  },
-  {
-    id: 'sparql-to-question',
-    name: 'SPARQL to Question',
-    tooltip: 'Convert a SPARQL query into a natural language question.'
   }
 ]);
+
+// tasks that take natural language input and thus support speech-to-text
+export const STT_TASKS = Object.freeze(['sparql-qa', 'general-qa', 'entity-linking']);
 
 export const QLEVER_HOSTS = Object.freeze([
   'qlever.cs.uni-freiburg.de',
@@ -71,7 +80,21 @@ export const QLEVER_HOSTS = Object.freeze([
   'qlever.dev'
 ]);
 
-export const endpointFor = (path) => `${API_BASE}${path}`;
+// A relative API base (e.g. "api") is resolved against the current document URL.
+// The app is only ever served at the mount root — "/", "/?share=:id", or a
+// single-segment KG path like "/wikidata" — so the document's directory is
+// always the app root, and relative API paths resolve correctly at any path
+// prefix depth with no <base> tag involved. (Pretty /share/:id links 302-redirect
+// to /?share=:id before the app boots; serving the app one level deep would
+// break Safari, which ignores an injected <base> for dynamically imported
+// modules — see nginx.conf.)
+
+export const endpointFor = (path) => {
+  if (isAbsoluteUrl || typeof window === 'undefined') {
+    return `${API_BASE}${path}`;
+  }
+  return new URL(`${API_BASE}${path}`, window.location.href).href;
+};
 
 export const wsEndpoint = () => {
   if (isAbsoluteUrl) {
@@ -91,7 +114,8 @@ export const sharePathForId = (id) => {
   const trimmed = typeof id === 'string' ? id.trim() : '';
   if (!trimmed) return '';
   if (typeof window === 'undefined') return '';
-  // Generate /share/:id path — nginx redirects this to /?share=:id
+  // Generate /share/:id path — in production nginx serves index.html for this
+  // path (URL unchanged) and the app reads the id from window.location.pathname.
   const base = window.location.pathname.replace(/\/+$/, '');
   return `${window.location.origin}${base}/share/${trimmed}`;
 };
