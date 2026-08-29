@@ -1,16 +1,16 @@
 import re
-import unicodedata
 from typing import Any
 
 from pydantic import BaseModel
 
 from grasp.configs import GraspConfig
 from grasp.examples import Sample
-from grasp.functions import find_manager, parse_iri_or_literal
+from grasp.functions import find_manager
 from grasp.manager import KgManager, format_kgs
 from grasp.model import Message
-from grasp.sparql.types import Alternative, ObjType
+from grasp.sparql.types import Alternative
 from grasp.tasks.base import FeedbackTask, GraspTask
+from grasp.tasks.entities import Entity, prepare_entity
 from grasp.utils import (
     FunctionCallException,
     format_enumerate,
@@ -20,15 +20,7 @@ from grasp.utils import (
 )
 
 
-class Annotation(BaseModel):
-    identifier: str
-    entity: str
-    label: str | None = None
-    aliases: list[str] | None = None
-    infos: list[str] | None = None
-
-
-class TextAnnotation(Annotation):
+class TextAnnotation(Entity):
     start_index: int
     end_index: int
 
@@ -114,14 +106,14 @@ class AnnotationState:
     ) -> None:
         self.text, self.offset = text.trim(context)
         self.annotation_window: slice = slice(self.text.start, self.text.end)
-        self.annotations: dict[tuple[int, int], Annotation] = {}
+        self.annotations: dict[tuple[int, int], Entity] = {}
 
     def annotate(
         self,
         start_index: int,
         end_index: int,
-        annotation: Annotation | None,
-    ) -> Annotation | None:
+        annotation: Entity | None,
+    ) -> Entity | None:
         aws = self.annotation_window.stop - self.annotation_window.start
         if start_index < 0 or start_index >= aws:
             raise ValueError(f"Start_index {start_index} out of bounds")
@@ -134,7 +126,7 @@ class AnnotationState:
             self.annotations[(start_index, end_index)] = annotation
         return current
 
-    def get(self, start_index: int, end_index: int) -> Annotation | None:
+    def get(self, start_index: int, end_index: int) -> Entity | None:
         return self.annotations.get((start_index, end_index), None)
 
     def to_dict(self) -> dict:
@@ -214,14 +206,7 @@ class AnnotationState:
                 if annot.identifier in entities:
                     continue
 
-                alternative = Alternative(
-                    annot.identifier,
-                    short_identifier=annot.entity,
-                    label=annot.label,
-                    aliases=annot.aliases,
-                    info=annot.infos,
-                )
-                entities[annot.identifier] = alternative
+                entities[annot.identifier] = annot.to_alternative()
 
             if entities:
                 annotations = format_list(
@@ -371,60 +356,13 @@ so always keep that in mind and adjust the occurrence_index accordingly.""",
     return fns
 
 
-def prepare_annotation(manager: KgManager, entity: str) -> Annotation:
-    binding = parse_iri_or_literal(entity, manager.iri_literal_parser, manager.prefixes)
-    if binding is None or binding.typ != "uri":
-        raise ValueError(f"Entity {entity} is not a valid IRI")
-
-    identifier = binding.identifier()
-
-    norm = manager.normalize(identifier, ObjType.ENTITY.index_name)
-    if norm is not None:
-        identifier, _ = norm
-
-    infos = manager.get_info_for_identifiers_from_index(
-        [identifier], ObjType.ENTITY.index_name
-    )
-
-    # format normalized identifier again, so always
-    # prefixed form is shown if available
-    entity = manager.format_iri(identifier)
-    # extract fields from info dict
-    info = infos.get(identifier, {})
-    label = info.get("label")
-    aliases = info.get("alias", [])
-    infos = info.get("info", [])
-
-    return Annotation(
-        identifier=identifier,
-        entity=entity,
-        label=label,
-        aliases=aliases,
-        infos=infos,
-    )
-
-
-def annotate(
-    managers: list[KgManager],
-    kg: str,
-    words_to_be_annotated: str,
-    occurrence_index: int,
-    entity: str | None,
-    state: AnnotationState,
-    known: set[str],
-    know_before_annotate: bool = False,
-    show_state_after_annotation: bool = True,
-) -> str:
-    # A function for the llm to call to annotate the words_to_be_annotated in the text
-    # with the entity and knowledge graph. The occurrence_index helps to distinguish
-    # between different occurrences of the words in the text excerpt.
-    manager, _ = find_manager(managers, kg)
-    sequence = state.text.data[state.annotation_window]
-
+def find_matches(
+    words_to_be_annotated: str, sequence: str, occurrence_index: int
+) -> tuple[int, int]:
     # normalizing, because some llms are heavily biased towards specific characters like
     # the ascii apostrophe although they are technically able to output the correct one.
     def normalize(string: str) -> str:
-        return unicodedata.normalize("NFC", string).replace("‘", "'").replace("’", "'")
+        return string.replace("‘", "'").replace("’", "'")
 
     words_to_be_annotated = normalize(words_to_be_annotated)
     sequence = normalize(sequence)
@@ -449,13 +387,33 @@ def annotate(
             f"number of matches: {len(word_matches)}."
         )
 
-    start_idx, end_idx = word_matches[occurrence_index]
+    return word_matches[occurrence_index]
+
+
+def annotate(
+    managers: list[KgManager],
+    kg: str,
+    words_to_be_annotated: str,
+    occurrence_index: int,
+    entity: str | None,
+    state: AnnotationState,
+    known: set[str],
+    know_before_annotate: bool = False,
+    show_state_after_annotation: bool = True,
+) -> str:
+    # A function for the llm to call to annotate the words_to_be_annotated in the text
+    # with the entity and knowledge graph. The occurrence_index helps to distinguish
+    # between different occurrences of the words in the text excerpt.
+    manager, _ = find_manager(managers, kg)
+    sequence = state.text.data[state.annotation_window]
+
+    start_idx, end_idx = find_matches(words_to_be_annotated, sequence, occurrence_index)
 
     try:
         if entity is None:
-            annotation = Annotation(identifier="<NIL>", entity="<NIL>")
+            annotation = Entity(identifier="<NIL>", entity="<NIL>")
         else:
-            annotation = prepare_annotation(manager, entity)
+            annotation = prepare_entity(manager, entity)
             if know_before_annotate and annotation.identifier not in known:
                 raise FunctionCallException(
                     f"The entity {entity} cannot be used for annotation "
@@ -499,37 +457,8 @@ def delete_annotation(
     # distinguish between different occurrences of the words in the text.
     sequence = state.text.data[state.annotation_window]
 
-    # normalizing, because some llms are heavily biased towards specific characters like
-    # the ascii apostrophe although they are technically able to output the correct one.
-    def normalize(string: str) -> str:
-        return unicodedata.normalize("NFC", string).replace("‘", "'").replace("’", "'")
+    start_idx, end_idx = find_matches(words_to_be_annotated, sequence, occurrence_index)
 
-    words_to_be_annotated = normalize(words_to_be_annotated)
-    sequence = normalize(sequence)
-
-    word_matches = [
-        m.span() for m in re.finditer(re.escape(words_to_be_annotated), sequence)
-    ]
-
-    if not word_matches:
-        raise ValueError(
-            f"No match found for the given words_to_be_annotated "
-            f"'{words_to_be_annotated}' in the current annotation window."
-            "(Did you use the correct characters when specifying the words?)"
-        )
-
-    if occurrence_index < 0:
-        raise ValueError(f"occurrence_index '{occurrence_index}' must be non negative.")
-
-    if occurrence_index >= len(word_matches):
-        raise ValueError(
-            f"occurrence_index '{occurrence_index}' must be less than "
-            f"number of matches: {len(word_matches)}."
-        )
-
-    start_idx, end_idx = word_matches[occurrence_index]
-
-    # deleting an annotation
     try:
         current = state.annotate(start_idx, end_idx, None)
     except ValueError as e:
