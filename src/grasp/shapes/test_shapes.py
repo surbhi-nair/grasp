@@ -2,6 +2,9 @@ from unittest.mock import Mock
 
 from grasp.build.shapes import (
     ClassMaps,
+    build_per_class_property_frequency_query,
+    build_schema_class_query,
+    build_total_entities_query,
     ClassProfile,
     DirectedMaps,
     PropertyFreq,
@@ -12,11 +15,13 @@ from grasp.build.shapes import (
     compute_shape,
     emit_pseudo_shex,
 )
-from grasp.configs import ShapeConfig
+from grasp.configs import GraspConfig, ShapeConfig
+from grasp.functions import call_shape_function
 from grasp.manager import KgManager
 from grasp.manager.normalizer import Normalizer, WikidataPropertyNormalizer
-from grasp.shapes import ShapeSample, Target, TargetClass, TargetLiteral
+from grasp.shapes import Shapes, ShapeSample, Target, TargetClass, TargetLiteral
 from grasp.sparql.types import AskResult, SelectResult
+from grasp.sparql.utils import load_iri_and_literal_parser
 
 
 def attach_normalizers(
@@ -918,3 +923,67 @@ class TestShapeSampleQueries:
         )
         s2 = ShapeSample.model_validate(s.model_dump())
         assert s2 == s
+
+
+def test_class_discovery_only_considers_iri_classes() -> None:
+    # literal objects of a typing predicate are not classes, and fail to
+    # parse once wrapped in <>
+    query = build_total_entities_query("?instance gkp:P0 {CLASS}")
+    assert "FILTER(ISIRI(?class))" in query
+
+    schema_query = build_schema_class_query("{CLASS} rdfs:subClassOf ?super")
+    assert "FILTER(ISIRI(?class))" in schema_query
+
+
+def test_class_discovery_ranks_by_instance_count() -> None:
+    # max_classes slices this result, so the order decides what gets profiled
+    query = build_total_entities_query("?instance gkp:P0 {CLASS}")
+    assert "ORDER BY DESC(?totalEntities)" in query
+    assert query.index("GROUP BY ?class") < query.index("ORDER BY DESC(?totalEntities)")
+
+
+def test_per_class_queries_are_not_iri_filtered() -> None:
+    # the class term is a concrete IRI here, so the filter would be dead weight
+    query = build_per_class_property_frequency_query(
+        "?instance gkp:P0 {CLASS}", "https://gptkb.org/concept/C0"
+    )
+    assert "ISIRI" not in query
+    assert "<https://gptkb.org/concept/C0>" in query
+
+
+class TestGetShapeIriGuard:
+    def make_shape_manager(self) -> Mock:
+        m = make_manager()
+        m.kg = "test"
+        m.iri_literal_parser = load_iri_and_literal_parser()
+        m.shape_config = ShapeConfig()
+        return m
+
+    def call(self, manager: Mock, iri: str) -> str:
+        shapes = Shapes(instance_pattern="?instance a {CLASS} .")
+        return call_shape_function(
+            "get_shape",
+            {"iri": iri},
+            shapes,
+            manager,
+            GraspConfig(),
+        )
+
+    def test_non_iri_argument_is_rejected_before_building_sparql(self) -> None:
+        # a bare label parses as a literal, and wrapping it in <> would only
+        # fail later as an opaque lexer error
+        manager = self.make_shape_manager()
+        result = self.call(manager, "airmail stamps")
+
+        assert "is not a valid IRI" in result
+        manager.execute_sparql.assert_not_called()
+
+    def test_iri_argument_reaches_computation(self) -> None:
+        manager = self.make_shape_manager()
+        manager.execute_sparql.side_effect = Exception("boom")
+
+        result = self.call(manager, "http://ex.org/Human")
+
+        # got past the guard and into compute_shape
+        assert "failed to compute on the fly" in result
+        assert manager.execute_sparql.called
