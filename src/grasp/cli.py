@@ -1318,7 +1318,13 @@ def construct_grasp(args: argparse.Namespace) -> None:
         logger.error("No KG managers available")
         return
 
-    manager, _ = find_manager(managers, args.knowledge_graph)
+    task_kwargs = config.task_kwargs.get("construct-gen", {})
+    ontology_mode = task_kwargs.get("ontology_mode", "custom")
+    ontology_kg_names = task_kwargs.get("ontology_kgs", []) if ontology_mode == "guided" else []
+    ontology_managers = [m for m in managers if m.kg in ontology_kg_names]
+
+    data_manager, _ = find_manager(managers, args.knowledge_graph)
+    
     notes, kg_notes = load_notes(config)
 
     output_dir = args.output_dir
@@ -1334,9 +1340,9 @@ def construct_grasp(args: argparse.Namespace) -> None:
     result = consume_generator(
         generate(
             "construct-gen",
-            None,
+            {"kg": args.knowledge_graph, "ontology_mode": ontology_mode, "ontology_kgs": ontology_kg_names},
             config,
-            managers,
+            [data_manager] + ontology_managers,
             kg_notes=kg_notes,
             notes=notes,
             logger=logger,
@@ -1353,42 +1359,56 @@ def construct_grasp(args: argparse.Namespace) -> None:
         logger.error("No output produced by the task")
         return
 
-    sparql = task_output.get("sparql")
+    # sparql = task_output.get("sparql") #TODO: change to multiple queries
+    queries = task_output.get("queries")
     kg = task_output.get("kg")
 
-    if not sparql:
-        logger.error("Task completed but no CONSTRUCT query was returned")
+    if not queries:
+        logger.error("Task completed but no CONSTRUCT queries were returned")
         return
 
-    # save the construct query
-    dump_text(sparql, os.path.join(output_dir, "construct.sparql"))
-    logger.info(f"CONSTRUCT query written to {output_dir}/construct.sparql")
+    # save all construct queries into one file, labeled by name
+    construct_text = "\n\n".join(
+        f"# Query: {q['name']}\n{q['sparql']}" for q in queries
+    )
+    dump_text(construct_text, os.path.join(output_dir, "construct.sparql"))
+    logger.info(f"CONSTRUCT queries written to {output_dir}/construct.sparql")
 
-    # execute the full query and save the .nt
-    logger.info("Executing full CONSTRUCT query...")
+    # execute each query and concatenate the resulting triples into one .nt
+    logger.info(f"Executing {len(queries)} CONSTRUCT query(ies)...")
     manager_for_kg, _ = find_manager(managers, kg)
-    req_params = {**manager_for_kg.params, "query": sparql}
-    req_headers = {**manager_for_kg.headers, "Accept": "text/plain"}
 
     import requests as req
-    response = req.get(
-        manager_for_kg.endpoint,
-        params=req_params,
-        headers=req_headers,
-        timeout=300.0,
-    )
 
-    if response.status_code != 200:
-        logger.error(f"CONSTRUCT query failed: HTTP {response.status_code}\n{response.text[:500]}")
-        return
+    nt_parts = []
+    for q in queries:
+        req_params = {**manager_for_kg.params, "query": q["sparql"]}
+        req_headers = {**manager_for_kg.headers, "Accept": "text/plain"}
 
-    nt_content = response.text
+        response = req.get(
+            manager_for_kg.endpoint,
+            params=req_params,
+            headers=req_headers,
+            timeout=300.0,
+        )
+
+        if response.status_code != 200:
+            logger.error(
+                f"CONSTRUCT query '{q['name']}' failed: "
+                f"HTTP {response.status_code}\n{response.text[:500]}"
+            )
+            return
+
+        triples = [ln for ln in response.text.splitlines() if ln.strip()]
+        logger.info(f"Query '{q['name']}' produced {len(triples)} triples")
+        nt_parts.extend(triples)
+
+    nt_content = "\n".join(nt_parts) + "\n"
     nt_path = os.path.join(output_dir, "semantic.nt")
     dump_text(nt_content, nt_path)
 
-    triple_count = sum(1 for l in nt_content.splitlines() if l.strip())
-    logger.info(f"Written {triple_count} triples to {nt_path}")
-
+    logger.info(f"Written {len(nt_parts)} total triples to {nt_path}")
+    
 def main():
     args = parse_args()
     if args.all_loggers:

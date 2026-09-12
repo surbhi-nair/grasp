@@ -34,6 +34,10 @@ from grasp.utils import (
     format_response,
     format_section,
 )
+from grasp.tasks.construct_gen import ConstructGenTask
+from universal_ml_utils.io import dump_json
+from universal_ml_utils.ops import consume_generator
+import os
 
 
 def system_instructions(
@@ -80,7 +84,10 @@ def system_instructions(
             )
         )
 
-    common_prefixes = get_common_sparql_prefixes()
+    common_prefixes = (
+    get_common_sparql_prefixes() if task.include_common_prefixes else {}
+    )
+
     if common_prefixes:
         blocks.append(
             format_section(
@@ -389,6 +396,69 @@ def generate(
         logger.debug(format_response(response))
 
         can_give_feedback = config.feedback and retries < config.max_feedbacks
+
+        # construct-gen review step
+        if should_stop and isinstance(task, ConstructGenTask):
+            task_kwargs = config.task_kwargs.get("construct-gen", {})
+            max_reviews = task_kwargs.get("max_reviews", 2)
+            review_trace_dir = task_kwargs.get("review_trace_dir", None) #TODO: remove/modify review traces saving process after debugging
+            can_review = retries < max_reviews
+ 
+            if not can_review:
+                break
+ 
+            output = task.output(messages)
+            if output is None:
+                break
+ 
+            try:
+                review_result = consume_generator(generate(
+                    "construct-review",
+                    { 
+                        # "sparql": output["sparql"],
+                        "queries": output["queries"], 
+                        "ontology_mode": task.ontology_mode
+                    },
+                    config,
+                    managers,
+                    kg_notes=kg_notes or {},
+                    notes=notes or [],
+                    logger=logger,
+                    yield_output=True,
+                ))
+            except Exception as e:
+                error = {
+                    "content": f"Failed to generate review:\n{e}",
+                    "reason": "review",
+                }
+                logger.error(format_error(**error))
+                break
+ 
+            if review_trace_dir:
+                os.makedirs(review_trace_dir, exist_ok=True)
+                dump_json(review_result, os.path.join(review_trace_dir, f"review_{retries}.json"))
+
+            review_result = review_result.get("output", None)
+
+            if review_result is None:
+                # reviewer failed, don't block submission
+                break
+ 
+            if review_result["status"] == "done":
+                break
+
+            # reviewer found issues, inject feedback and let main agent fix
+            messages.append(
+                Message.user(format_feedback(review_result), name="feedback")
+            )
+            yield {
+                "type": "feedback",
+                "status": review_result["status"],
+                "feedback": review_result["feedback"]
+            }
+            retries += 1
+            last_resp_hash = None # reset loop detection
+            continue # main agent fixes issues and resubmits
 
         if should_stop and not can_give_feedback:
             # done
