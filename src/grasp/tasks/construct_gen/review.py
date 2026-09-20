@@ -4,7 +4,12 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.utils import FunctionCallException, format_notes
+from grasp.utils import (
+    FunctionCallException,
+    format_enumerate,
+    format_notes,
+    format_section,
+)
 
 
 _REVIEW_SYSTEM_BASE = """\
@@ -39,7 +44,7 @@ everywhere it's referenced, whether within a single query or across the query se
 
 _REVIEW_CHECKLIST_GUIDED = _REVIEW_CHECKLIST_COMMON + """
 - NAMESPACE CONSISTENCY: For any predicates or entity IRIs that fall back to \
-a custom namespace, verify they use that namespace consistently throughout \
+a custom namespace, verify that this namespace reflects the intended domain and semantics, and use that namespace consistently throughout \
 the queries.
 - ONTOLOGY PREDICATE CORRECTNESS: For every predicate chosen from a standard ontology, \
 confirm that the value assigned is compatible with what that predicate expects. \
@@ -56,7 +61,22 @@ with how the ontology defines it should be used.\
 
 _REVIEW_CHECKLIST_CUSTOM = _REVIEW_CHECKLIST_COMMON + """
 - NAMESPACE CONSISTENCY: Verify that all custom predicates and entity IRIs \
-use the same namespace consistently throughout the queries.\
+use the same namespace consistently throughout the queries and that this namespace reflects \
+the intended domain and semantics. Judge this from the expanded IRI, not the prefix \
+alias.\
+"""
+
+_REVIEW_CHECKLIST_CQ = """
+- COMPETENCY QUESTION COVERAGE: For each competency question listed, write the SPARQL query \
+that would answer it against the knowledge graph the proposed CONSTRUCT queries would produce. \
+You cannot execute it, since that graph does not exist yet, but writing it out is a usability \
+test of the model: if the query answering it is overly complex and requires additional work \
+to produce the correct result, that \
+points to a gap in the semantic modelling itself and should be flagged. Flag any question \
+that could not be answered at all, and say which part of the model is the reason.
+- COMPETENCY QUESTION SCOPE: Competency questions are a minimum, not the full scope. Confirm \
+the model has not been narrowed or made redundant to accommodate the questions while sacrificing \
+SOURCE COVERAGE.\
 """
 
 _REVIEW_CHECKLIST_CROSS_QUERY = """
@@ -87,12 +107,14 @@ class ConstructReviewTask(GraspTask):
         managers: list[KgManager],
         config: GraspConfig,
         known: set[str] | None = None,
+        example_indices: dict | None = None,
     ) -> None:
-        super().__init__(managers, config, known)
+        super().__init__(managers, config, known, example_indices)
         self.data_manager = self.managers[0]
         self.ontology_managers = self.managers[1:]
         self.ontology_mode: Literal["guided", "custom"] = "custom"
         self.queries: list[dict] = []
+        self.competency_questions: list[str] = []
 
     def system_information(self) -> str:
         checklist = (
@@ -100,15 +122,24 @@ class ConstructReviewTask(GraspTask):
             if self.ontology_mode == "guided"
             else _REVIEW_CHECKLIST_CUSTOM
         ).format(kg_name=self.data_manager.kg)
+        if self.competency_questions:
+            checklist += _REVIEW_CHECKLIST_CQ.format(kg_name=self.data_manager.kg)
         if len(self.queries) > 1:
             checklist += _REVIEW_CHECKLIST_CROSS_QUERY
-            
+
         parts = [_REVIEW_SYSTEM_BASE, checklist]
         if self.ontology_mode == "guided" and self.ontology_managers:
             parts.append(
                 _ONTOLOGY_KG_NOTE
                 + "\nOntology KGs: "
                 + ", ".join(f'"{m.kg}"' for m in self.ontology_managers)
+            )
+        if self.competency_questions:
+            parts.append(
+                format_section(
+                    "Competency questions",
+                    format_enumerate(self.competency_questions),
+                )
             )
         return "\n\n".join(parts)
 
@@ -175,6 +206,7 @@ query an issue applies to. If status is done, briefly summarise what was verifie
         assert isinstance(input, dict), "Input for construct-review must be a dict"
         self.ontology_mode = input.get("ontology_mode", "custom")
         self.queries = input.get("queries", [])
+        self.competency_questions = input.get("competency_questions", []) or []
  
         if len(self.queries) == 1:
             sparql = self.queries[0]["sparql"]

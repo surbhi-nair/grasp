@@ -1309,6 +1309,32 @@ def shapes_build_grasp(args: argparse.Namespace) -> None:
         search_params=get_embedding_search_params(args),
     )
 
+def load_competency_questions(file: str | None) -> list[str]:
+    """Load competency questions from a JSON file holding a list of strings."""
+    if file is None:
+        return []
+
+    questions = load_json(file)
+    if not isinstance(questions, list) or not all(
+        isinstance(q, str) for q in questions
+    ):
+        raise ValueError(
+            f"Competency questions file {file} must contain a JSON list of strings"
+        )
+
+    # drop empties and duplicates, keeping the original order
+    seen: set[str] = set()
+    unique = []
+    for question in questions:
+        question = question.strip()
+        if not question or question in seen:
+            continue
+        seen.add(question)
+        unique.append(question)
+
+    return unique
+
+
 def construct_grasp(args: argparse.Namespace) -> None:
     logger = get_logger("GRASP CONSTRUCT", args.log_level)
     config = GraspConfig(**load_config(args.config))
@@ -1322,6 +1348,15 @@ def construct_grasp(args: argparse.Namespace) -> None:
     ontology_mode = task_kwargs.get("ontology_mode", "custom")
     ontology_kg_names = task_kwargs.get("ontology_kgs", []) if ontology_mode == "guided" else []
     ontology_managers = [m for m in managers if m.kg in ontology_kg_names]
+
+    competency_questions = load_competency_questions(
+        task_kwargs.get("competency_questions_file")
+    )
+    if competency_questions:
+        logger.info(
+            f"Loaded {len(competency_questions)} competency question(s) from "
+            f"{task_kwargs['competency_questions_file']}"
+        )
 
     data_manager, _ = find_manager(managers, args.knowledge_graph)
     
@@ -1340,7 +1375,12 @@ def construct_grasp(args: argparse.Namespace) -> None:
     result = consume_generator(
         generate(
             "construct-gen",
-            {"kg": args.knowledge_graph, "ontology_mode": ontology_mode, "ontology_kgs": ontology_kg_names},
+            {
+                "kg": args.knowledge_graph,
+                "ontology_mode": ontology_mode,
+                "ontology_kgs": ontology_kg_names,
+                "competency_questions": competency_questions,
+            },
             config,
             [data_manager] + ontology_managers,
             kg_notes=kg_notes,

@@ -416,8 +416,9 @@ def generate(
                     "construct-review",
                     { 
                         # "sparql": output["sparql"],
-                        "queries": output["queries"], 
-                        "ontology_mode": task.ontology_mode
+                        "queries": output["queries"],
+                        "ontology_mode": task.ontology_mode,
+                        "competency_questions": task.competency_questions,
                     },
                     config,
                     managers,

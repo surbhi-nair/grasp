@@ -4,7 +4,7 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
-from grasp.utils import FunctionCallException
+from grasp.utils import FunctionCallException, format_enumerate, format_section
 
 import requests
 
@@ -38,7 +38,7 @@ semantics and expected value types match your intended mapping. Do not generate 
 CONSTRUCT queries targeting these KGs.\
 """
 
-_STEPS_GUIDED = """\
+_STEPS_GUIDED_DESIGN = """\
 You should follow a step-by-step approach:
 1. Explore the knowledge graph — use the available notes (and shape profile \
 if available) as a starting point, and run targeted queries where needed to \
@@ -46,9 +46,11 @@ fill gaps. Get a clear picture of what classes and entities/predicates exist, \
 what the values look like, and what the data is about, and where the existing \
 modelling is already sound versus where it needs improvement.
 2. Design the mapping:
-- Decide what entities to model, how to construct their IRIs from stable identifiers \
-in the data, what type to assign them, what fields represent inter-entity relationships \
-and what consistent domain-specific namespace to use.
+- Decide what entities to model, what type to assign each, and what fields represent \
+inter-entity relationships.
+- Decide how to map them: mint IRIs from a stable identifier of the entity itself, in a \
+namespace that reflects the domain — replacing the source's if it does not.
+- Identify what null looks like in the data and how to handle it in the mapping.
 - Decide whether one CONSTRUCT query is enough to cover the data completely, \
 or whether the relationships in the knowledge graph require multiple queries. \
 There is no fixed number, but together the queries must cover all the data without loss.
@@ -58,14 +60,9 @@ search_entity for classes and search_property for predicates are the most direct
 approach, but notes and other functions are available too. A term is a good match \
 when its semantics and expected value type/domain/range align with your intended \
 mapping. Only fall back to the custom namespace if no ontology term fits after a \
-genuine search.
-3. Write each CONSTRUCT query and test it independently using propose_construct. \
-Give it a name the first time you test it, and reuse that same name in submit_construct. \
-Check that it runs and produces non-empty, well-formed output.
-4. Once every query you planned is ready, submit all queries together using submit_construct.
-"""
+genuine search."""
 
-_STEPS_CUSTOM = """\
+_STEPS_CUSTOM_DESIGN = """\
 You should follow a step-by-step approach:
 1. Explore the knowledge graph — use the available notes (and shape profile \
 if available) as a starting point, and run targeted queries where needed to \
@@ -73,17 +70,64 @@ fill gaps. Get a clear picture of what classes and entities/predicates exist, \
 what the values look like, and what the data is about, and where the existing \
 modelling is already sound versus where it needs improvement.
 2. Design the mapping:
-- Decide what entities to model, how to construct their IRIs from stable identifiers \
-in the data, what type to assign them, and what consistent domain-specific namespace to use.
+- Decide what entities to model, what type to assign each, and what fields represent \
+inter-entity relationships.
+- Decide how to map them: mint IRIs from a stable identifier of the entity itself, in a \
+namespace that reflects the domain — replacing the source's if it does not.
+- Identify what null looks like in the data and how to handle it in the mapping.
 - Decide whether one CONSTRUCT query is enough to cover the data completely, or whether the \
 relationships in the knowledge graph require multiple queries. There is no fixed number — let \
 what you find in the knowledge graph decide, but together the queries must cover \
-all the data without loss.
+all the data without loss."""
+
+_STEPS_WRITE_TEST = """\
 3. Write each CONSTRUCT query and test it independently using propose_construct. \
 Give it a name the first time you test it, and reuse that same name in submit_construct. \
-Check that it runs and produces non-empty, well-formed output.
-4. Once every query you planned is ready, submit all queries together using submit_construct.
+Check that it runs and produces non-empty, well-formed output."""
+
+# inserted before submission, only when competency questions are given
+_STEPS_COMPETENCY_CHECK = """\
+{n}. Before submitting, check the queries you wrote against each competency question by \
+sketching the SPARQL query that would answer it against the graph produced \
+by your queries. Use it as a usability test to see if the model is semantically well-formed \
+and easy to query. If the question cannot be answered against the model at all, the design is \
+missing something that has to be fixed. Do not narrow or make the model redundant \
+to make the competency questions easier to answer."""
+
+_STEPS_SUBMIT = """\
+{n}. Once every query you planned is ready, submit all queries together using submit_construct.
 """
+
+
+def _steps(
+    ontology_mode: Literal["guided", "custom"],
+    competency_questions: list[str],
+) -> str:
+    parts = [
+        _STEPS_GUIDED_DESIGN
+        if ontology_mode == "guided"
+        else _STEPS_CUSTOM_DESIGN
+    ]
+    parts.append(_STEPS_WRITE_TEST)
+    n = 4
+    if competency_questions:
+        parts.append(_STEPS_COMPETENCY_CHECK.format(n=n))
+        n += 1
+    parts.append(_STEPS_SUBMIT.format(n=n))
+    return "\n".join(parts)
+
+_COMPETENCY_QUESTIONS_NOTE = """\
+Treat each competency question listed below as a query someone may later write against your \
+output knowledge graph, and use it as a semantic usability test of the model that you propose: if \
+the query answering it is overly complex - that verbosity of the SPARQL query may point \
+to a gap in the semantic modelling itself that can be improved unless the underlying \
+data requires such modeling.
+
+The list of competency questions is not exhaustive — it states the minimum the \
+output knowledge graph must be able to answer, not the full scope of it. \
+Modelling all of the source data completely still applies.
+"""
+
 
 def _system_base(kg_name: str) -> str:
     return (
@@ -99,7 +143,10 @@ def system_information(
     ontology_mode: Literal["guided", "custom"],
     data_kg_name: str,
     ontology_kg_names: list[str],
+    competency_questions: list[str] | None = None,
 ) -> str:
+    competency_questions = competency_questions or []
+
     parts = [_system_base(data_kg_name)]
     if ontology_mode == "guided" and ontology_kg_names:
         parts.append(
@@ -107,27 +154,32 @@ def system_information(
             + "\nOntology KGs: "
             + ", ".join(f'"{n}"' for n in ontology_kg_names)
         )
-    steps = _STEPS_GUIDED if ontology_mode == "guided" else _STEPS_CUSTOM
-    parts.append(steps)
+    parts.append(_steps(ontology_mode, competency_questions))
+    if competency_questions:
+        parts.append(_COMPETENCY_QUESTIONS_NOTE)
+        parts.append(
+            format_section(
+                "Competency questions",
+                format_enumerate(competency_questions),
+            )
+        )
     return "\n\n".join(parts)
 
 _RULES_COMMON = [
-"Always add rdfs:label to every entity in the CONSTRUCT.",
-"Construct entity IRIs from a reliable unique identifier so the same \
-entity always maps to the same IRI.",
-"Not all fields may have a value for every entity — some might be missing \
-or carry a dataset-specific null marker. Inspect the data to identify what \
-null looks like in this knowledge graph before deciding how to handle it.",
-"Where a field can be missing, generate it independently (e.g. with \
+"Always add rdfs:label to every entity in the CONSTRUCT but never make the label \
+a precondition for the entity's other triples — a missing label shouldn't drop \
+the entity from the query.",
+"Where a property may be missing for a particular entity, generate it independently (e.g. with \
 OPTIONAL) so a missing value doesn't suppress triples for the other \
-fields of the same entity — but only where the data is actually \
-nullable, not as a blanket pattern for every predicate. Never emit a \
-triple with the null marker itself as the value.",
+properties of the same entity — but only where the data is actually \
+missing, not as a blanket pattern for every property.",
+"Never emit a triple with a null marker itself as the value.",
 "If the same entity type is referenced by more than one query, mint its \
-IRIs using the exact same pattern (the same identifier source and the same \
-IRI template) in every query that touches it, and reuse the same predicate \
+IRIs using the exact same pattern in every query that touches it, and reuse the same predicate \
 names and namespace for the same concept across queries, so the queries \
 combine into one coherent, non-conflicting graph.",
+"A field name may carry information the value itself doesn't — a unit, a currency, a scale. \
+Keep that information in the model rather than losing it with the name.",
 "When resubmitting after reviewer feedback, always call submit_construct \
 with the complete set of queries, including any that did not change — not \
 just the one(s) you fixed."
@@ -145,13 +197,15 @@ class ConstructGenTask(GraspTask):
         managers: list[KgManager],
         config: GraspConfig,
         known: set[str] | None = None,
+        example_indices: dict | None = None,
     ) -> None:
-        super().__init__(managers, config, known)
+        super().__init__(managers, config, known, example_indices)
 
         self.data_manager = self.managers[0]
         self.ontology_managers = self.managers[1:]
 
         self.ontology_mode: Literal["guided", "custom"] = "custom"
+        self.competency_questions: list[str] = []
 
         # output state
         self.final_queries: list[dict] | None = None
@@ -162,6 +216,7 @@ class ConstructGenTask(GraspTask):
             self.ontology_mode,
             self.data_manager.kg,
             [m.kg for m in self.ontology_managers],
+            self.competency_questions,
         )
 
     def rules(self) -> list[str]:
@@ -320,6 +375,7 @@ class ConstructGenTask(GraspTask):
     def setup(self, input: Any) -> str:
         assert isinstance(input, dict), "Input for construct-gen must be a dict"
         self.ontology_mode = input.get("ontology_mode", "custom")
+        self.competency_questions = input.get("competency_questions", []) or []
         return (
             f'Analyse the "{self.data_manager.kg}" knowledge graph and generate '
             f"one or more SPARQL CONSTRUCT queries that model it as a well-formed, "
