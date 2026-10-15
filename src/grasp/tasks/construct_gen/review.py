@@ -4,6 +4,10 @@ from grasp.configs import GraspConfig
 from grasp.manager import KgManager
 from grasp.model import Message
 from grasp.tasks.base import GraspTask
+from grasp.tasks.construct_gen.coverage import (
+    compute_source_coverage,
+    format_source_coverage,
+)
 from grasp.utils import (
     FunctionCallException,
     format_enumerate,
@@ -115,6 +119,8 @@ class ConstructReviewTask(GraspTask):
         self.ontology_mode: Literal["guided", "custom"] = "custom"
         self.queries: list[dict] = []
         self.competency_questions: list[str] = []
+        # computed in setup() and shown to the reviewer as data
+        self.coverage: dict = {}
 
     def system_information(self) -> str:
         checklist = (
@@ -210,21 +216,29 @@ query an issue applies to. If status is done, briefly summarise what was verifie
  
         if len(self.queries) == 1:
             sparql = self.queries[0]["sparql"]
-            return (
+            prompt = (
                 f'Review the following SPARQL CONSTRUCT query targeting the '
                 f'"{self.data_manager.kg}" knowledge graph:\n\n'
                 f'```sparql\n{sparql}\n```'
             )
- 
-        blocks = "\n\n".join(
-            f"### {q['name']}\n```sparql\n{q['sparql']}\n```"
-            for q in self.queries
+        else:
+            blocks = "\n\n".join(
+                f"### {q['name']}\n```sparql\n{q['sparql']}\n```"
+                for q in self.queries
+            )
+            prompt = (
+                f'Review the following {len(self.queries)} SPARQL CONSTRUCT queries '
+                f'targeting the "{self.data_manager.kg}" knowledge graph. Together '
+                f'they are intended to produce one coherent semantic graph:\n\n{blocks}'
+            )
+
+        self.coverage = compute_source_coverage(
+            self.data_manager,
+            self.queries,
+            self.config.sparql_request_timeout,
+            self.config.sparql_read_timeout,
         )
-        return (
-            f'Review the following {len(self.queries)} SPARQL CONSTRUCT queries '
-            f'targeting the "{self.data_manager.kg}" knowledge graph. Together '
-            f'they are intended to produce one coherent semantic graph:\n\n{blocks}'
-        )
+        return prompt + "\n\n" + format_source_coverage(self.coverage)
 
     def output(self, messages: list[Message]) -> dict | None:
         for message in reversed(messages):

@@ -15,11 +15,14 @@ def _construct_request(
     params: dict,
     timeout: float = 30.0,
 ) -> str:
-    req_params = {**params, "query": sparql}
-    req_headers = {**headers, "Accept": "text/plain"}
-    response = requests.get(
+    req_headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/plain",
+        **headers,
+    }
+    response = requests.post(
         endpoint,
-        params=req_params,
+        data={**params, "query": sparql},
         headers=req_headers,
         timeout=timeout,
     )
@@ -75,6 +78,8 @@ inter-entity relationships.
 - Decide how to map them: mint IRIs from a stable identifier of the entity itself, in a \
 namespace that reflects the domain — replacing the source's if it does not.
 - Identify what null looks like in the data and how to handle it in the mapping.
+- Identify whether there are unit informations like currency, scale or language metadata etc. \
+associated with the data and how to handle them in the mapping.\
 - Decide whether one CONSTRUCT query is enough to cover the data completely, or whether the \
 relationships in the knowledge graph require multiple queries. There is no fixed number — let \
 what you find in the knowledge graph decide, but together the queries must cover \
@@ -182,7 +187,9 @@ combine into one coherent, non-conflicting graph.",
 Keep that information in the model rather than losing it with the name.",
 "When resubmitting after reviewer feedback, always call submit_construct \
 with the complete set of queries, including any that did not change — not \
-just the one(s) you fixed."
+just the one(s) you fixed. If you are deliberately dropping a query you \
+submitted before, list it in the `removed` argument with the reason, so the \
+decision is recorded rather than silent."
 ]
 
 class ConstructGenTask(GraspTask):
@@ -209,6 +216,12 @@ class ConstructGenTask(GraspTask):
 
         # output state
         self.final_queries: list[dict] | None = None
+        # names of the last accepted submission, to detect dropped queries
+        self.submitted_names: set[str] = set()
+        # queries the model explicitly withdrew, with its reasons
+        self.removed_queries: list[dict] = []
+        # verdict of the last review round
+        self.review: dict | None = None
 
 
     def system_information(self) -> str:
@@ -286,8 +299,40 @@ class ConstructGenTask(GraspTask):
                                 "additionalProperties": False,
                             },
                         },
+                        "removed": {
+                            "type": ["array", "null"],
+                            "description": (
+                                "Queries you submitted previously and are now "
+                                "deliberately dropping. Any previously submitted "
+                                "query missing from `queries` must be listed here "
+                                "with the reason it is no longer needed. Use null "
+                                "or an empty list when nothing was dropped."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": (
+                                            "Name of the previously submitted query "
+                                            "being dropped."
+                                        ),
+                                    },
+                                    "reason": {
+                                        "type": "string",
+                                        "description": (
+                                            "Why this query is no longer part of the "
+                                            "set, and where its data is covered now "
+                                            "if it still is."
+                                        ),
+                                    },
+                                },
+                                "required": ["name", "reason"],
+                                "additionalProperties": False,
+                            },
+                        },
                     },
-                    "required": ["queries"],
+                    "required": ["queries", "removed"],
                     "additionalProperties": False,
                 },
                 "strict": True,
@@ -330,12 +375,12 @@ class ConstructGenTask(GraspTask):
                     "Check your WHERE clause, table filter, and NULL handling."
                 )
 
-            preview = "\n".join(lines[:20])
+            preview = "\n".join(lines[:20]) # at most 20 triples
             return f"Preview for '{name}' ({len(lines)} triples with LIMIT 10):\n{preview}"
 
         elif fn_name == "submit_construct":
             queries = fn_args["queries"]
-            self.final_queries = None
+            self.final_queries = None # reset any earlier accepted submission
 
             if not queries:
                 return "At least one CONSTRUCT query must be submitted."
@@ -359,11 +404,32 @@ class ConstructGenTask(GraspTask):
                     f"{', '.join(sorted(duplicates))}. Please resubmit with a "
                     "unique name for each query."
                 )
- 
+
+            # a query that was submitted before and is now gone has to be
+            # declared, so the drop is recorded rather than silent
+            removed = fn_args.get("removed") or []
+            declared = {r["name"].strip() for r in removed} # names of queries the model explicitly withdrew
+            dropped = self.submitted_names - set(names) # names of queries that are missing without an explicit declaration
+            undeclared = dropped - declared
+            if undeclared:
+                return (
+                    "These queries were part of your previous submission but are "
+                    f"missing from this one: {', '.join(sorted(undeclared))}. "
+                    "Resubmit with them included, or list each one in `removed` "
+                    "with the reason it is no longer needed and where its data is "
+                    "covered instead."
+                )
+
             self.final_queries = [
                 {"name": q["name"].strip(), "sparql": q["sparql"].strip()}
                 for q in queries
             ]
+            self.submitted_names = set(names)
+            self.removed_queries.extend( # accumulated reasons across rounds
+                {"name": r["name"].strip(), "reason": r["reason"].strip()}
+                for r in removed
+                if r["name"].strip() in dropped
+            )
             submitted = ", ".join(f"`{q['name']}`" for q in self.final_queries)
             return f"CONSTRUCT queries submitted ({submitted}). Saving output."
  
@@ -393,7 +459,9 @@ class ConstructGenTask(GraspTask):
         return {
             "type": "output",
             "queries": self.final_queries,
+            "removed": self.removed_queries,
             "kg": self.data_manager.kg,
+            "review": self.review,
             "formatted": (
                 f"CONSTRUCT queries for {self.data_manager.kg}:\n\n{blocks}"
             ),

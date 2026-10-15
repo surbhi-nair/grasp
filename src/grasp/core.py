@@ -405,12 +405,16 @@ def generate(
             can_review = retries < max_reviews
  
             if not can_review:
+                # the review budget is spent; if the last verdict was not "done"
+                # the queries ship with issues the reviewer reported in last round
+                if task.review is not None and task.review["status"] != "done":
+                    task.review["exhausted"] = True
                 break
- 
+
             output = task.output(messages)
             if output is None:
                 break
- 
+
             try:
                 review_result = consume_generator(generate(
                     "construct-review",
@@ -433,8 +437,14 @@ def generate(
                     "reason": "review",
                 }
                 logger.error(format_error(**error))
+                task.review = {
+                    "status": "error",
+                    "feedback": f"the reviewer failed to run: {e}",
+                    "rounds": retries,
+                    "exhausted": False,
+                }
                 break
- 
+
             if review_trace_dir:
                 os.makedirs(review_trace_dir, exist_ok=True)
                 dump_json(review_result, os.path.join(review_trace_dir, f"review_{retries}.json"))
@@ -443,8 +453,21 @@ def generate(
 
             if review_result is None:
                 # reviewer failed, don't block submission
+                task.review = {
+                    "status": "error",
+                    "feedback": "the reviewer returned no feedback",
+                    "rounds": retries,
+                    "exhausted": False,
+                }
                 break
- 
+
+            task.review = {
+                "status": review_result["status"],
+                "feedback": review_result["feedback"],
+                "rounds": retries + 1,
+                "exhausted": False,
+            }
+
             if review_result["status"] == "done":
                 break
 
