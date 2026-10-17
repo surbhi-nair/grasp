@@ -18,6 +18,23 @@ from grasp.sparql.types import SelectResult
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 
+_RDFS = "http://www.w3.org/2000/01/rdf-schema#"
+_OWL = "http://www.w3.org/2002/07/owl#"
+# predicates that only describe the source schema (its T-Box), not row data;
+# the queries are not expected to carry these over, so they are not counted
+SCHEMA_PREDICATES = {
+    _RDFS + "domain",
+    _RDFS + "range",
+    _RDFS + "subClassOf",
+    _RDFS + "subPropertyOf",
+    _OWL + "inverseOf",
+    _OWL + "equivalentClass",
+    _OWL + "equivalentProperty",
+    _OWL + "disjointWith",
+    _OWL + "imports",
+    _OWL + "versionInfo",
+}
+
 _PREFIX_RE = re.compile(r"PREFIX\s+([A-Za-z][\w.\-]*)?:\s*<([^>]*)>", re.IGNORECASE)
 _FULL_IRI_RE = re.compile(r"<([^>\s]+)>")
 # a prefixed name such as `player:player_api_id`; the lookbehind keeps it from
@@ -97,6 +114,7 @@ def compute_source_coverage(
     except Exception as e:
         return {"error": f"could not list source predicates: {e}"}
 
+    predicates = [(iri, count) for iri, count in predicates if iri not in SCHEMA_PREDICATES]
     if not predicates:
         return {"error": "the source knowledge graph reported no predicates"}
 

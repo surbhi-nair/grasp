@@ -185,11 +185,11 @@ names and namespace for the same concept across queries, so the queries \
 combine into one coherent, non-conflicting graph.",
 "A field name may carry information the value itself doesn't — a unit, a currency, a scale. \
 Keep that information in the model rather than losing it with the name.",
-"When resubmitting after reviewer feedback, always call submit_construct \
-with the complete set of queries, including any that did not change — not \
-just the one(s) you fixed. If you are deliberately dropping a query you \
-submitted before, list it in the `removed` argument with the reason, so the \
-decision is recorded rather than silent."
+"When resubmitting after reviewer feedback, send only the queries you changed \
+or added; to change a query, send it again under the same name. Queries you do \
+not send are kept as they are. To delete a query, list it in the `removed` \
+argument with the reason. The reply lists the full current set; check that it \
+is what you intend."
 ]
 
 class ConstructGenTask(GraspTask):
@@ -214,10 +214,10 @@ class ConstructGenTask(GraspTask):
         self.ontology_mode: Literal["guided", "custom"] = "custom"
         self.competency_questions: list[str] = []
 
-        # output state
-        self.final_queries: list[dict] | None = None
-        # names of the last accepted submission, to detect dropped queries
-        self.submitted_names: set[str] = set()
+        # output state: the current set of submitted queries, by name
+        self.queries: dict[str, dict] = {}
+        # whether the most recent submit_construct call was accepted
+        self.submit_ok = False
         # queries the model explicitly withdrew, with its reasons
         self.removed_queries: list[dict] = []
         # verdict of the last review round
@@ -269,17 +269,22 @@ class ConstructGenTask(GraspTask):
             {
                 "name": "submit_construct",
                 "description": (
-                    "Submit the final set of SPARQL CONSTRUCT query (or queries). "
-                    "The query will be saved and executed to produce the semantic "
+                    "Submit or update the SPARQL CONSTRUCT queries. The current "
+                    "set will be saved and executed to produce the semantic "
                     "RDF output. Only call this once you are satisfied with the "
-                    "query after testing it with propose_construct."
+                    "queries after testing them with propose_construct."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "queries": {
                             "type": "array",
-                            "description": "The final list of SPARQL CONSTRUCT queries.",
+                            "description": (
+                                "On your first call, all queries. On later calls, "
+                                "only queries that are new or changed. A query with "
+                                "the same name as a submitted one replaces it; "
+                                "submitted queries you do not send are kept unchanged."
+                            ),
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -302,11 +307,9 @@ class ConstructGenTask(GraspTask):
                         "removed": {
                             "type": ["array", "null"],
                             "description": (
-                                "Queries you submitted previously and are now "
-                                "deliberately dropping. Any previously submitted "
-                                "query missing from `queries` must be listed here "
-                                "with the reason it is no longer needed. Use null "
-                                "or an empty list when nothing was dropped."
+                                "Submitted queries to delete, each with the reason "
+                                "it is no longer needed. Use null or an empty list "
+                                "when nothing is deleted."
                             ),
                             "items": {
                                 "type": "object",
@@ -379,11 +382,15 @@ class ConstructGenTask(GraspTask):
             return f"Preview for '{name}' ({len(lines)} triples with LIMIT 10):\n{preview}"
 
         elif fn_name == "submit_construct":
-            queries = fn_args["queries"]
-            self.final_queries = None # reset any earlier accepted submission
+            self.submit_ok = False
+            queries = fn_args.get("queries") or []
+            removed = fn_args.get("removed") or []
 
-            if not queries:
-                return "At least one CONSTRUCT query must be submitted."
+            if not queries and not removed:
+                return (
+                    "Your call contained no queries and no removals, so nothing "
+                    "was changed. Call submit_construct again."
+                )
 
             names = [q["name"].strip() for q in queries]
             if any(not n for n in names):
@@ -405,38 +412,42 @@ class ConstructGenTask(GraspTask):
                     "unique name for each query."
                 )
 
-            # a query that was submitted before and is now gone has to be
-            # declared, so the drop is recorded rather than silent
-            removed = fn_args.get("removed") or []
-            declared = {r["name"].strip() for r in removed} # names of queries the model explicitly withdrew
-            dropped = self.submitted_names - set(names) # names of queries that are missing without an explicit declaration
-            undeclared = dropped - declared
-            if undeclared:
+            unknown = [r["name"].strip() for r in removed if r["name"].strip() not in self.queries]
+            if unknown:
                 return (
-                    "These queries were part of your previous submission but are "
-                    f"missing from this one: {', '.join(sorted(undeclared))}. "
-                    "Resubmit with them included, or list each one in `removed` "
-                    "with the reason it is no longer needed and where its data is "
-                    "covered instead."
+                    f"Cannot remove {', '.join(unknown)}: no submitted query has "
+                    "that name. Nothing was changed."
                 )
 
-            self.final_queries = [
-                {"name": q["name"].strip(), "sparql": q["sparql"].strip()}
-                for q in queries
-            ]
-            self.submitted_names = set(names)
+            # update a copy, so a rejected call leaves the current set untouched
+            new = dict(self.queries)
+            for r in removed:
+                new.pop(r["name"].strip())
+            added = [n for n in names if n not in new]
+            replaced = [n for n in names if n in new]
+            for q in queries:
+                new[q["name"].strip()] = {"name": q["name"].strip(), "sparql": q["sparql"].strip()}
+
+            if not new:
+                return "This would leave no queries at all. Nothing was changed."
+
+            self.queries = new
             self.removed_queries.extend( # accumulated reasons across rounds
                 {"name": r["name"].strip(), "reason": r["reason"].strip()}
                 for r in removed
-                if r["name"].strip() in dropped
             )
-            submitted = ", ".join(f"`{q['name']}`" for q in self.final_queries)
-            return f"CONSTRUCT queries submitted ({submitted}). Saving output."
+            self.submit_ok = True
+            return (
+                f"CONSTRUCT queries saved. Added: {', '.join(added) or 'none'}. "
+                f"Replaced: {', '.join(replaced) or 'none'}. "
+                f"Removed: {', '.join(r['name'].strip() for r in removed) or 'none'}. "
+                f"Current set ({len(new)}): {', '.join(new)}."
+            )
  
         raise FunctionCallException(f"Unknown function: {fn_name}")
  
     def done(self, fn_name: str) -> bool:
-        return fn_name == "submit_construct" and self.final_queries is not None
+        return fn_name == "submit_construct" and self.submit_ok
 
     def setup(self, input: Any) -> str:
         assert isinstance(input, dict), "Input for construct-gen must be a dict"
@@ -449,16 +460,17 @@ class ConstructGenTask(GraspTask):
         )
 
     def output(self, messages: list[Message]) -> dict | None:
-        if self.final_queries is None:
+        if not self.queries:
             return None
- 
+
+        queries = list(self.queries.values())
         blocks = "\n\n".join(
             f"### {q['name']}\n```sparql\n{q['sparql']}\n```"
-            for q in self.final_queries
+            for q in queries
         )
         return {
             "type": "output",
-            "queries": self.final_queries,
+            "queries": queries,
             "removed": self.removed_queries,
             "kg": self.data_manager.kg,
             "review": self.review,

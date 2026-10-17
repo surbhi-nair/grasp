@@ -415,48 +415,66 @@ def generate(
             if output is None:
                 break
 
-            try:
-                review_result = consume_generator(generate(
-                    "construct-review",
-                    { 
-                        # "sparql": output["sparql"],
-                        "queries": output["queries"],
-                        "ontology_mode": task.ontology_mode,
-                        "competency_questions": task.competency_questions,
-                    },
-                    config,
-                    managers,
-                    kg_notes=kg_notes or {},
-                    notes=notes or [],
-                    logger=logger,
-                    yield_output=True,
-                ))
-            except Exception as e:
+            # a reviewer run without a verdict (crash, or no give_feedback
+            # call) is re-run on the same queries; these attempts do not
+            # count against max_reviews
+            max_review_attempts = task_kwargs.get("max_review_attempts", 3)
+            review_result = None
+            review_failure = None
+            for attempt in range(max_review_attempts):
+                try:
+                    review_trace = consume_generator(generate(
+                        "construct-review",
+                        { 
+                            # "sparql": output["sparql"],
+                            "queries": output["queries"],
+                            "ontology_mode": task.ontology_mode,
+                            "competency_questions": task.competency_questions,
+                        },
+                        config,
+                        managers,
+                        kg_notes=kg_notes or {},
+                        notes=notes or [],
+                        logger=logger,
+                        yield_output=True,
+                    ))
+                except Exception as e:
+                    review_failure = f"the reviewer failed to run: {e}"
+                    logger.error(format_error(
+                        content=f"Failed to generate review:\n{e}",
+                        reason="review",
+                    ))
+                    continue
+
+                if review_trace_dir:
+                    os.makedirs(review_trace_dir, exist_ok=True)
+                    trace_name = f"review_{retries}.json" if attempt == 0 \
+                        else f"review_{retries}_attempt{attempt}.json"
+                    dump_json(review_trace, os.path.join(review_trace_dir, trace_name))
+
+                review_result = review_trace.get("output", None)
+                if review_result is not None:
+                    break
+
+                review_failure = "the reviewer returned no feedback"
+                logger.warning(
+                    f"Reviewer returned no feedback "
+                    f"(attempt {attempt + 1}/{max_review_attempts})"
+                )
+
+            if review_result is None:
+                # every attempt failed; ship, but mark the run as unreviewed
                 error = {
-                    "content": f"Failed to generate review:\n{e}",
+                    "content": f"No review after {max_review_attempts} attempts: "
+                    f"{review_failure}",
                     "reason": "review",
                 }
                 logger.error(format_error(**error))
                 task.review = {
                     "status": "error",
-                    "feedback": f"the reviewer failed to run: {e}",
+                    "feedback": review_failure,
                     "rounds": retries,
-                    "exhausted": False,
-                }
-                break
-
-            if review_trace_dir:
-                os.makedirs(review_trace_dir, exist_ok=True)
-                dump_json(review_result, os.path.join(review_trace_dir, f"review_{retries}.json"))
-
-            review_result = review_result.get("output", None)
-
-            if review_result is None:
-                # reviewer failed, don't block submission
-                task.review = {
-                    "status": "error",
-                    "feedback": "the reviewer returned no feedback",
-                    "rounds": retries,
+                    "attempts": max_review_attempts,
                     "exhausted": False,
                 }
                 break
